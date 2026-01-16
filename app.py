@@ -1,97 +1,130 @@
 import streamlit as st
 import pandas as pd
 import datetime
-import urllib.parse
+import requests
 
-# --- CONFIGURATION (UPDATE THESE!) ---
-# 1. The "Published to Web" CSV link from File -> Share -> Publish to Web
+# --- CONFIGURATION ---
+
+# 1. Your Public Data Link
 CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vT43MImVIp6adY__EY41RO6KeVQ0j-zkwXkSQqKPp7F3X53bFzIJij32--uii2rqNsyHhjtmpmox5hK/pub?output=csv"
 
-# 2. Your Google Form Base URL (everything before ?usp=pp_url)
-FORM_BASE_URL = "https://docs.google.com/forms/d/e/1FAIpQLSc9X8zW7LDbk_j4sZvvzrLCtn9jqHyBvnONgrgRsle0Xqt-Eg/viewform"
+# 2. Your Google Form URL (Converted to formResponse for automation)
+FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSc9X8zW7LDbk_j4sZvvzrLCtn9jqHyBvnONgrgRsle0Xqt-Eg/formResponse"
 
-# 3. The Entry IDs found in your "Get pre-filled link" (Step 1.3)
-# Replace these numbers with YOUR specific entry IDs
+# 3. Your Form Entry IDs
 ENTRY_IDS = {
-    "User": "entry.240380346",    # Look for entry.ID for User
-    "Date": "entry.1665164856",    # Look for entry.ID for Date
-    "Day": "entry.425091818",     # Look for entry.ID for Day
-    "Result": "entry.1179485822",  # Look for entry.ID for Result
-    "Amount": "entry.1710124537"   # Look for entry.ID for Amount
+    "User": "entry.240380346",    
+    "Date": "entry.1665164856",   
+    "Day": "entry.425091818",     
+    "Result": "entry.1179485822", 
+    "Amount": "entry.1710124537"  
 }
 
 # --- APP SETUP ---
 st.set_page_config(page_title="Services Jeopardy Tracker", layout="wide")
-st.title("Services Jeopardy Tracker")
+st.title("🏆 Services Jeopardy Tracker")
 
+# Game Rules: Day Index 0=Mon, 6=Sun
 VALUES = {0: 200, 1: 600, 2: 1000, 3: 400, 4: 1200, 5: 2000, 6: 0}
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 # --- FUNCTIONS ---
+@st.cache_data(ttl=300) # Cache for 5 mins to align with Google Sheets publish rate
 def get_data():
     try:
-        # We add a timestamp to the URL to try and trick the cache, 
-        # though Google often caches "Publish to Web" for ~5 mins regardless.
-        df = pd.read_csv(f"{CSV_URL}&cachebuster={datetime.datetime.now().timestamp()}")
+        # Timestamp hack to bypass some caching
+        timestamp = datetime.datetime.now().timestamp()
+        df = pd.read_csv(f"{CSV_URL}&t={timestamp}")
         return df
-    except Exception as e:
-        st.error("Could not read data. Check your CSV_URL.")
-        return pd.DataFrame()
+    except Exception:
+        # Return empty structure if read fails
+        return pd.DataFrame(columns=["User", "Date", "Day", "Result", "Amount"])
 
-def generate_form_link(user, date, day_name, result, amount):
-    params = {
+def send_data_to_google(user, date, day, result, amount):
+    form_data = {
         ENTRY_IDS["User"]: user,
         ENTRY_IDS["Date"]: str(date),
-        ENTRY_IDS["Day"]: day_name,
+        ENTRY_IDS["Day"]: day,
         ENTRY_IDS["Result"]: result,
-        ENTRY_IDS["Amount"]: str(amount) # Google forms expect strings
+        ENTRY_IDS["Amount"]: str(amount)
     }
-    query_string = urllib.parse.urlencode(params)
-    return f"{FORM_BASE_URL}?{query_string}"
+    try:
+        # Silent background submission
+        response = requests.post(FORM_URL, data=form_data)
+        return response.status_code == 200
+    except:
+        return False
 
-# --- SIDEBAR ---
+# --- SESSION STATE (For Instant Feedback) ---
+if 'temp_data' not in st.session_state:
+    st.session_state.temp_data = []
+
+# --- LOAD DATA ---
+csv_df = get_data()
+
+# Merge CSV data with session state data (scores submitted in this session)
+if st.session_state.temp_data:
+    temp_df = pd.DataFrame(st.session_state.temp_data)
+    # Ensure columns match for concatenation
+    full_df = pd.concat([csv_df, temp_df], ignore_index=True)
+else:
+    full_df = csv_df
+
+# --- SIDEBAR: INPUT ---
 st.sidebar.header("📝 Log Today's Score")
-df = get_data()
 
-# User Selection
-existing_users = sorted(df['User'].unique().tolist()) if not df.empty else []
+# 1. User Selection
+# Safely get unique users from the dataframe
+if not full_df.empty and 'User' in full_df.columns:
+    all_users = sorted(list(set(full_df['User'].dropna().astype(str).unique())))
+else:
+    all_users = []
+
 user_mode = st.sidebar.radio("User Mode", ["Existing Player", "New Player"], horizontal=True)
-if user_mode == "Existing Player" and existing_users:
-    user = st.sidebar.selectbox("Select Player", existing_users)
+
+if user_mode == "Existing Player" and all_users:
+    user = st.sidebar.selectbox("Select Player", all_users)
 else:
     user = st.sidebar.text_input("Enter Name")
 
-# Date Selection
+# 2. Date Selection
 date = st.sidebar.date_input("Date", datetime.date.today())
 day_index = date.weekday()
 day_name = DAYS[day_index]
 base_value = VALUES[day_index]
+
 st.sidebar.markdown(f"**Day:** {day_name}")
 
-# Logic
+# 3. Game Logic
 final_amount = 0
 result_log = ""
 ready_to_submit = False
 
 if user:
-    # SUNDAY LOGIC
+    # --- SUNDAY (Wager Logic) ---
     if day_index == 6: 
         st.sidebar.info("🎲 It's Sunday! Wager time.")
         
-        # Calculate Wager Limit
-        if not df.empty:
-            df['DateObj'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+        # Calculate Wager Limit (Sum of Mon-Sat for this specific week)
+        if not full_df.empty and 'Date' in full_df.columns and 'Amount' in full_df.columns:
+            full_df['DateObj'] = pd.to_datetime(full_df['Date'], errors='coerce').dt.date
+            full_df['AmountNumeric'] = pd.to_numeric(full_df['Amount'], errors='coerce').fillna(0)
+            
+            # Find the Monday of this selected week
             start_of_week = date - datetime.timedelta(days=date.weekday())
-            mask = (df['User'] == user) & (df['DateObj'] >= start_of_week) & (df['DateObj'] < date)
-            current_week_total = df[mask]['Amount'].sum()
+            # Sum only amounts from this week, up to yesterday (Saturday)
+            mask = (full_df['User'] == user) & (full_df['DateObj'] >= start_of_week) & (full_df['DateObj'] < date)
+            current_week_total = full_df[mask]['AmountNumeric'].sum()
         else:
             current_week_total = 0
             
-        wager_limit = abs(current_week_total) if not pd.isna(current_week_total) else 0
-        st.sidebar.write(f"Week Total: **${current_week_total}** | Max Wager: **${wager_limit}**")
+        wager_limit = abs(current_week_total)
+        st.sidebar.write(f"Week Total: **${current_week_total:,.0f}**")
+        st.sidebar.write(f"Max Wager: **${wager_limit:,.0f}**")
         
-        wager = st.sidebar.number_input("Wager", min_value=0, max_value=int(wager_limit) if wager_limit > 0 else 0, value=0)
-        outcome = st.sidebar.radio("Result", ["Correct", "Incorrect"])
+        # Wager Input
+        wager = st.sidebar.number_input("Wager Amount", min_value=0, max_value=int(wager_limit) if wager_limit > 0 else 0, value=0)
+        outcome = st.sidebar.radio("Did you get it right?", ["Correct", "Incorrect"])
         
         if outcome == "Correct":
             final_amount = wager
@@ -102,10 +135,10 @@ if user:
         
         ready_to_submit = True
 
-    # MON-SAT LOGIC
+    # --- MON-SAT (Fixed Value Logic) ---
     else:
         st.sidebar.markdown(f"Value: **${base_value}**")
-        outcome = st.sidebar.radio("Result", ["Correct", "Incorrect", "Pass"])
+        outcome = st.sidebar.radio("Result", ["Correct", "Incorrect", "Pass/No Answer"])
         
         if outcome == "Correct":
             final_amount = base_value
@@ -119,37 +152,46 @@ if user:
             
         ready_to_submit = True
 
-    # SUBMIT BUTTON (LINK GENERATOR)
+    # --- SUBMIT BUTTON ---
     if ready_to_submit:
         st.sidebar.divider()
-        st.sidebar.write("### Confirm Score")
-        st.sidebar.write(f"Amount to save: **${final_amount}**")
+        st.sidebar.write(f"Saving Score: **${final_amount}**")
         
-        # Generate the magic link
-        submit_url = generate_form_link(user, date, day_name, result_log, final_amount)
-        
-        # We use a link button because we cannot POST directly without an API Key
-        st.sidebar.markdown(f'''
-        <a href="{submit_url}" target="_blank">
-            <button style="width:100%; background-color:#FF4B4B; color:white; border:none; padding:10px; border-radius:5px; font-weight:bold; cursor:pointer;">
-                Step 1: Click to Submit to Google
-            </button>
-        </a>
-        ''', unsafe_allow_html=True)
-        
-        st.sidebar.info("ℹ️ After clicking, hit 'Submit' on the form tab. Data will appear here in ~5 mins.")
+        if st.sidebar.button("Submit Score", type="primary"):
+            success = send_data_to_google(user, date, day_name, result_log, final_amount)
+            
+            if success:
+                st.sidebar.success("✅ Saved Successfully!")
+                # Add to session state so it shows up instantly without waiting for Google Sheet refresh
+                st.session_state.temp_data.append({
+                    "User": user,
+                    "Date": str(date),
+                    "Day": day_name,
+                    "Result": result_log,
+                    "Amount": final_amount
+                })
+                st.rerun()
+            else:
+                st.sidebar.error("❌ Network Error: Could not connect to Google Forms.")
 
-# --- DASHBOARD (Leaderboards) ---
-if df.empty:
-    st.info("No data found. Submit a score via the sidebar!")
+# --- DASHBOARD ---
+if full_df.empty:
+    st.info("No data found yet. Be the first to add a score!")
 else:
-    # Basic cleaning
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+    # Data Cleaning for Display
+    if 'Date' in full_df.columns:
+        full_df['Date'] = pd.to_datetime(full_df['Date'], errors='coerce')
+    if 'Amount' in full_df.columns:
+        full_df['Amount'] = pd.to_numeric(full_df['Amount'], errors='coerce').fillna(0)
     
-    tab1, tab2, tab3 = st.tabs(["Weekly", "Annual", "All Time"])
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["Weekly Leaderboard", "Annual Leaderboard", "All Time"])
     
     def render_leaderboard(dataframe, time_filter=None):
+        if dataframe.empty:
+            st.write("No data available.")
+            return
+
         if time_filter == "Weekly":
             today = pd.Timestamp.today()
             start_week = today - pd.Timedelta(days=today.dayofweek)
@@ -159,19 +201,24 @@ else:
              today = pd.Timestamp.today()
              dataframe = dataframe[dataframe['Date'].dt.year == today.year]
              
-        leaderboard = dataframe.groupby('User')['Amount'].sum().sort_values(ascending=False).reset_index()
-        leaderboard['Amount'] = leaderboard['Amount'].apply(lambda x: f"${x:,.0f}")
-        st.dataframe(leaderboard, use_container_width=True, hide_index=True)
+        if not dataframe.empty:
+            leaderboard = dataframe.groupby('User')['Amount'].sum().sort_values(ascending=False).reset_index()
+            leaderboard['Amount'] = leaderboard['Amount'].apply(lambda x: f"${x:,.0f}")
+            # Add ranking index
+            leaderboard.index = leaderboard.index + 1
+            st.dataframe(leaderboard, use_container_width=True)
+        else:
+            st.write("No scores for this period yet.")
 
     with tab1:
-        st.subheader("Current Week")
-        render_leaderboard(df, "Weekly")
+        st.subheader("Current Week (Mon-Sun)")
+        render_leaderboard(full_df, "Weekly")
     with tab2:
         st.subheader("This Year")
-        render_leaderboard(df, "Annual")
+        render_leaderboard(full_df, "Annual")
     with tab3:
-        st.subheader("All Time")
-        render_leaderboard(df)
-        
+        st.subheader("All Time Hall of Fame")
+        render_leaderboard(full_df)
+    
     st.divider()
-    st.caption("Data refreshes automatically every ~5 minutes via Google Sheets.")
+    st.caption("Updates sync to Google Sheets every ~5 minutes. Recent inputs are shown locally.")
