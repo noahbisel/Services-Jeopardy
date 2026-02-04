@@ -22,7 +22,6 @@ st.title("🏆 Services Jeopardy Tracker")
 
 VALUES = {0: 200, 1: 600, 2: 1000, 3: 400, 4: 1200, 5: 2000, 6: 0}
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-# Short names for the column headers
 DAY_ABBREVIATIONS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -57,26 +56,24 @@ if 'temp_data' not in st.session_state:
 # --- LOAD & PROCESS DATA ---
 csv_df = get_data()
 
-# Merge CSV with Session State
 if st.session_state.temp_data:
     temp_df = pd.DataFrame(st.session_state.temp_data)
     full_df = pd.concat([csv_df, temp_df], ignore_index=True)
 else:
     full_df = csv_df
 
-# Standardize Data
 if not full_df.empty:
     full_df['Date'] = pd.to_datetime(full_df['Date'], errors='coerce')
     full_df['Amount'] = pd.to_numeric(full_df['Amount'], errors='coerce').fillna(0)
     
-    # Clean duplicates (Edits)
+    # Handle Edits (Keep last entry per user/date)
     raw_df = full_df.copy() 
     clean_df = full_df.drop_duplicates(subset=['User', 'Date'], keep='last')
 else:
     raw_df = pd.DataFrame()
     clean_df = pd.DataFrame()
 
-# --- SIDEBAR: INPUT ---
+# --- SIDEBAR ---
 st.sidebar.header("📝 Log Today's Score")
 
 if not full_df.empty and 'User' in full_df.columns:
@@ -191,30 +188,22 @@ else:
     
     today = pd.Timestamp.today()
 
-    # --- 1. WEEKLY DASHBOARD (Enhanced Visuals) ---
+    # --- 1. WEEKLY DASHBOARD ---
     with tab1:
         st.subheader("Current Week (Mon-Sun)")
         
-        # Calculate current week start
         start_week = today - pd.Timedelta(days=today.dayofweek)
         start_week = start_week.replace(hour=0, minute=0, second=0, microsecond=0)
         end_week = start_week + pd.Timedelta(days=7)
 
-        # Filter for this week
         weekly_df = clean_df[(clean_df['Date'] >= start_week) & (clean_df['Date'] < end_week)].copy()
 
         if not weekly_df.empty:
-            # Create abbreviations mapping
-            # We map the full Day name to the Abbreviation (Monday -> Mon)
-            # But we must be careful: if user enters data across years, 'Day' column might be tricky.
-            # Best to derive Day Name directly from Date to be safe
             weekly_df['DayAbbrev'] = weekly_df['Date'].dt.day_name().apply(lambda x: x[:3])
 
-            # 1. Calculate Totals separate from the visual table
             totals = weekly_df.groupby('User')['Amount'].sum().reset_index()
             totals.rename(columns={'Amount': 'Total'}, inplace=True)
 
-            # 2. Create Visual Indicators
             def get_visual_result(result):
                 res_lower = str(result).lower()
                 if "correct" in res_lower and "incorrect" not in res_lower:
@@ -227,38 +216,27 @@ else:
 
             weekly_df['Visual'] = weekly_df['Result'].apply(get_visual_result)
 
-            # 3. Pivot the table: Users (rows) x Days (columns)
             pivot_visuals = weekly_df.pivot_table(
                 index='User', 
                 columns='DayAbbrev', 
                 values='Visual', 
-                aggfunc='first' # Since clean_df handles duplicates, we just take the value
+                aggfunc='first'
             )
 
-            # 4. Reorder Columns explicitly to be Mon -> Sun
-            # Ensure all days exist in columns even if no one played that day yet
             for day in DAY_ABBREVIATIONS:
                 if day not in pivot_visuals.columns:
-                    pivot_visuals[day] = "N/A" # Placeholder if column missing completely
+                    pivot_visuals[day] = "N/A"
             
-            # Sort columns Mon-Sun
             pivot_visuals = pivot_visuals[DAY_ABBREVIATIONS]
-            
-            # Fill missing cells (did not play that specific day) with N/A
             pivot_visuals = pivot_visuals.fillna("N/A")
 
-            # 5. Join with Totals
             final_weekly_view = pivot_visuals.merge(totals, on='User', how='left')
-            
-            # Sort by Total Descending
             final_weekly_view = final_weekly_view.sort_values(by='Total', ascending=False)
             
-            # Configure formatting for Streamlit DataFrame
-            # We want compact columns for days, and Currency for Total
+            # CONFIG: Keep Total as a NUMBER, just format the display
             column_config = {
                 "Total": st.column_config.NumberColumn("Total Score", format="$%d"),
             }
-            # Add config for every day column to be small
             for day in DAY_ABBREVIATIONS:
                 column_config[day] = st.column_config.TextColumn(day, width="small")
 
@@ -278,13 +256,21 @@ else:
         
         if not monthly_df.empty:
             leaderboard = monthly_df.groupby('User')['Amount'].sum().sort_values(ascending=False).reset_index()
-            leaderboard['Amount'] = leaderboard['Amount'].apply(lambda x: f"${x:,.0f}")
+            # FIX: Do not convert to string here! Keep as number.
             leaderboard.index = leaderboard.index + 1
-            st.dataframe(leaderboard, use_container_width=True)
+            
+            # Apply format via column_config instead
+            st.dataframe(
+                leaderboard, 
+                use_container_width=True,
+                column_config={
+                    "Amount": st.column_config.NumberColumn("Amount", format="$%d")
+                }
+            )
         else:
             st.write("No scores this month.")
 
-    # --- 3. ANNUAL DASHBOARD (Pivot) ---
+    # --- 3. ANNUAL DASHBOARD (Fixed Sorting) ---
     with tab3:
         st.subheader(f"{today.year} Performance")
         annual_df = clean_df[clean_df['Date'].dt.year == today.year].copy()
@@ -300,23 +286,31 @@ else:
             
             pivot = pivot.reindex(sorted(pivot.columns), axis=1)
             
+            # Rename columns to Jan, Feb...
             new_columns = {}
             for m in pivot.columns:
                 new_columns[m] = MONTHS[m-1]
-            
             pivot = pivot.rename(columns=new_columns)
-            formatted_pivot = pivot.copy().astype(object)
+            
+            # FIX: Keep data as numeric. Use None for future months (not "--").
+            formatted_pivot = pivot.copy()
             
             for col_idx in range(1, 13):
                 month_name = MONTHS[col_idx-1]
                 if col_idx > current_month_num:
-                    formatted_pivot[month_name] = "--"
-                else:
-                    formatted_pivot[month_name] = formatted_pivot[month_name].apply(
-                        lambda x: f"${x:,.0f}" if pd.notnull(x) and x != "--" else "$0"
-                    )
+                    formatted_pivot[month_name] = None # Empty cell allows correct sorting
 
-            st.dataframe(formatted_pivot, use_container_width=True)
+            # Generate config for all months to show Currency
+            month_config = {
+                m: st.column_config.NumberColumn(m, format="$%d") 
+                for m in MONTHS
+            }
+
+            st.dataframe(
+                formatted_pivot, 
+                use_container_width=True, 
+                column_config=month_config
+            )
         else:
             st.write("No data for this year.")
     
